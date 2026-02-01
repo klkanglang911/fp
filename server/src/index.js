@@ -16,10 +16,8 @@ const initTesseract = async (fastifyInstance) => {
   try {
     if (!tesseractWorker) {
       fastifyInstance.log.info('初始化 Tesseract.js 本地 OCR...')
-      tesseractWorker = await Tesseract.createWorker({
-        langPath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@v5/tesseract-core.wasm.js'
-      })
-      await tesseractWorker.loadLanguage('chi_sim,chi_tra,eng')
+      tesseractWorker = await Tesseract.createWorker()
+      await tesseractWorker.loadLanguage('chi_sim')
       await tesseractWorker.initialize('chi_sim')
       fastifyInstance.log.info('Tesseract.js 初始化完成')
     }
@@ -329,6 +327,276 @@ const callBaiduMultipleInvoice = async ({ imageBase64, pdfBase64 }) => {
   const data = await response.json()
   if (data.error_code) {
     const error = new Error(data.error_msg || '智能财务票据识别失败')
+    error.code = data.error_code
+    throw error
+  }
+
+  return data
+}
+
+// 计算字段置信度的辅助函数
+const calculateFieldConfidenceForFallback = (extractedFields) => {
+  const fieldConfidences = {
+    invoiceNumber: extractedFields.invoiceNumber ? 0.85 : 0,
+    invoiceDate: extractedFields.invoiceDate ? 0.85 : 0,
+    buyerName: extractedFields.buyerName ? 0.85 : 0,
+    sellerName: extractedFields.sellerName ? 0.85 : 0,
+    itemName: extractedFields.itemName ? 0.85 : 0,
+    totalAmount: extractedFields.totalAmount ? 0.85 : 0
+  }
+
+  const validScores = Object.values(fieldConfidences).filter(c => c > 0)
+  const overallConfidence = validScores.length > 0
+    ? validScores.reduce((a, b) => a + b) / 6  // 除以 6（总字段数）而不是有效数量
+    : 0
+
+  return { fieldConfidences, overallConfidence }
+}
+
+// 三层降级 OCR 识别函数
+const recognizeWithFallback = async ({
+  imageBase64,
+  skipLocal = false,
+  providers = ['baidu'],
+  baiduApiKey,
+  baiduSecretKey,
+  tencentSecretId,
+  tencentSecretKey,
+  tencentRegion,
+  googleApiKey,
+  googleProjectId,
+  pdfBase64,
+  fileName,
+  confidenceThreshold = 0.8
+}) => {
+  const results = []
+  let bestResult = null
+  const usedProviders = []
+
+  // 第一层：本地 Tesseract.js OCR（如果启用）
+  if (!skipLocal) {
+    try {
+      fastify.log.info('尝试使用本地 Tesseract.js...')
+
+      const worker = await initTesseract(fastify)
+      if (worker) {
+        // 从 base64 转换为 Buffer
+        const imageBuffer = Buffer.from(
+          imageBase64.replace(/^data:image\/\w+;base64,/, ''),
+          'base64'
+        )
+
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('超时')), Number(process.env.TESSERACT_TIMEOUT_MS ?? 10000))
+        )
+
+        const result = await Promise.race([
+          worker.recognize(imageBuffer),
+          timeoutPromise
+        ])
+
+        const fullText = result.data.text || ''
+        const { fieldConfidences, overallConfidence } = calculateFieldConfidence(fullText)
+
+        // 提取字段值
+        const invoiceNumber = (fullText.match(/发票号码[：:]*(\d{8,})/i) || [])[1] || ''
+        const invoiceDate = (fullText.match(/开票日期[：:]*(\d{4}[-年]\d{1,2}[-月]\d{1,2})/i) || [])[1] || ''
+        const buyerName = (fullText.match(/购买方[：:]*([^\n]+)/i) || [])[1]?.trim() || ''
+        const sellerName = (fullText.match(/销售方[：:]*([^\n]+)/i) || [])[1]?.trim() || ''
+        const itemName = (fullText.match(/货物[、，]?服务[、，]?名称[：:]*([^\n]+)/i) || [])[1]?.trim() || ''
+        const totalAmount = (fullText.match(/价税合计[：:]*([0-9,]+\.?\d*)/i) || [])[1] || ''
+
+        const localResult = {
+          success: true,
+          data: {
+            invoiceNumber,
+            invoiceDate,
+            buyerName,
+            sellerName,
+            itemName,
+            totalAmount
+          },
+          meta: {
+            source: 'local',
+            overallConfidence,
+            fieldConfidences,
+            fallbackReason: null
+          }
+        }
+
+        if (overallConfidence >= confidenceThreshold) {
+          fastify.log.info(`本地 Tesseract.js 成功，置信度：${overallConfidence}`)
+          usedProviders.push({ provider: 'local', status: 'success', confidence: overallConfidence })
+          return { result: localResult, usedProviders }
+        } else {
+          usedProviders.push({ provider: 'local', status: 'low_confidence', confidence: overallConfidence })
+          results.push(localResult)
+        }
+      }
+    } catch (error) {
+      fastify.log.warn('本地 Tesseract.js 失败，进入第二层:', error.message)
+      usedProviders.push({ provider: 'local', status: 'failed', error: error.message })
+    }
+  }
+
+  // 第二层：用户选择的云服务（百度/腾讯）
+  for (const provider of providers) {
+    if (provider === 'baidu' && baiduApiKey && baiduSecretKey) {
+      try {
+        fastify.log.info('尝试使用百度 OCR...')
+        const baiduResult = await runBaiduOcrLogic({
+          imageBase64,
+          pdfBase64,
+          apiKey: baiduApiKey,
+          secretKey: baiduSecretKey,
+          fastifyInstance: fastify
+        })
+
+        if (baiduResult) {
+          const { fieldConfidences, overallConfidence } = calculateFieldConfidenceForFallback({
+            invoiceNumber: getBaiduField(baiduResult.words_result, 'InvoiceNum'),
+            invoiceDate: getBaiduField(baiduResult.words_result, 'InvoiceDate'),
+            buyerName: getBaiduField(baiduResult.words_result, 'PurchaserName'),
+            sellerName: getBaiduField(baiduResult.words_result, 'SellerName'),
+            itemName: Array.isArray(getBaiduField(baiduResult.words_result, 'CommodityName'))
+              ? getBaiduField(baiduResult.words_result, 'CommodityName')[0]?.word
+              : '',
+            totalAmount: getBaiduField(baiduResult.words_result, 'AmountInFiguers')
+          })
+
+          const baiduFallbackResult = {
+            success: true,
+            data: {
+              invoiceNumber: getBaiduField(baiduResult.words_result, 'InvoiceNum'),
+              invoiceDate: getBaiduField(baiduResult.words_result, 'InvoiceDate'),
+              buyerName: getBaiduField(baiduResult.words_result, 'PurchaserName'),
+              sellerName: getBaiduField(baiduResult.words_result, 'SellerName'),
+              totalAmount: getBaiduField(baiduResult.words_result, 'AmountInFiguers')
+            },
+            meta: {
+              source: 'baidu',
+              overallConfidence,
+              fieldConfidences,
+              fallbackReason: null
+            }
+          }
+
+          if (overallConfidence >= confidenceThreshold) {
+            fastify.log.info(`百度 OCR 成功，置信度：${overallConfidence}`)
+            usedProviders.push({ provider: 'baidu', status: 'success', confidence: overallConfidence })
+            return { result: baiduFallbackResult, usedProviders }
+          } else {
+            usedProviders.push({ provider: 'baidu', status: 'low_confidence', confidence: overallConfidence })
+            results.push(baiduFallbackResult)
+          }
+        }
+      } catch (error) {
+        fastify.log.warn('百度 OCR 失败:', error.message)
+        usedProviders.push({ provider: 'baidu', status: 'failed', error: error.message })
+      }
+    }
+
+    if (provider === 'tencent' && tencentSecretId && tencentSecretKey) {
+      try {
+        fastify.log.info('尝试使用腾讯 OCR...')
+        const tencentResult = await callTencentVatInvoice({
+          imageBase64,
+          secretId: tencentSecretId,
+          secretKey: tencentSecretKey,
+          region: tencentRegion
+        })
+
+        const mappedResult = mapTencentVatToBaidu(tencentResult)
+        if (mappedResult) {
+          const { fieldConfidences, overallConfidence } = calculateFieldConfidenceForFallback({
+            invoiceNumber: getBaiduField(mappedResult.words_result, 'InvoiceNum'),
+            invoiceDate: getBaiduField(mappedResult.words_result, 'InvoiceDate'),
+            buyerName: getBaiduField(mappedResult.words_result, 'PurchaserName'),
+            sellerName: getBaiduField(mappedResult.words_result, 'SellerName'),
+            itemName: Array.isArray(getBaiduField(mappedResult.words_result, 'CommodityName'))
+              ? getBaiduField(mappedResult.words_result, 'CommodityName')[0]?.word
+              : '',
+            totalAmount: getBaiduField(mappedResult.words_result, 'AmountInFiguers')
+          })
+
+          const tencentFallbackResult = {
+            success: true,
+            data: {
+              invoiceNumber: getBaiduField(mappedResult.words_result, 'InvoiceNum'),
+              invoiceDate: getBaiduField(mappedResult.words_result, 'InvoiceDate'),
+              buyerName: getBaiduField(mappedResult.words_result, 'PurchaserName'),
+              sellerName: getBaiduField(mappedResult.words_result, 'SellerName'),
+              totalAmount: getBaiduField(mappedResult.words_result, 'AmountInFiguers')
+            },
+            meta: {
+              source: 'tencent',
+              overallConfidence,
+              fieldConfidences,
+              fallbackReason: null
+            }
+          }
+
+          if (overallConfidence >= confidenceThreshold) {
+            fastify.log.info(`腾讯 OCR 成功，置信度：${overallConfidence}`)
+            usedProviders.push({ provider: 'tencent', status: 'success', confidence: overallConfidence })
+            return { result: tencentFallbackResult, usedProviders }
+          } else {
+            usedProviders.push({ provider: 'tencent', status: 'low_confidence', confidence: overallConfidence })
+            results.push(tencentFallbackResult)
+          }
+        }
+      } catch (error) {
+        fastify.log.warn('腾讯 OCR 失败:', error.message)
+        usedProviders.push({ provider: 'tencent', status: 'failed', error: error.message })
+      }
+    }
+  }
+
+  // 返回最高置信度的结果
+  if (results.length > 0) {
+    bestResult = results.reduce((best, current) =>
+      (current.meta.overallConfidence > (best.meta.overallConfidence || 0)) ? current : best
+    )
+
+    return {
+      result: {
+        ...bestResult,
+        meta: { ...bestResult.meta, fallbackReason: '置信度低于阈值，使用备选方案' }
+      },
+      usedProviders
+    }
+  }
+
+  // 全部失败
+  return {
+    result: null,
+    usedProviders,
+    error: '所有 OCR 服务都失败'
+  }
+}
+
+// 百度 OCR 逻辑提取为独立函数（供三层降级使用）
+const runBaiduOcrLogic = async ({ imageBase64, pdfBase64, apiKey, secretKey, fastifyInstance }) => {
+  const token = await getAccessToken({ apiKey, secretKey })
+
+  // 尝试 VAT 发票识别
+  const params = new URLSearchParams()
+  params.set('image', imageBase64)
+
+  const response = await fetch(
+    `https://aip.baidubce.com/rest/2.0/ocr/v1/vat_invoice?access_token=${token}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: params,
+    },
+  )
+
+  const data = await response.json()
+  if (data.error_code) {
+    const error = new Error(data.error_msg || 'OCR 失败')
     error.code = data.error_code
     throw error
   }
@@ -850,6 +1118,73 @@ fastify.post('/ocr/baidu/vat', async (request, reply) => {
     const message = error instanceof Error ? error.message : 'OCR 处理失败'
     const code = error?.code
     return reply.code(502).send({ message, code })
+  }
+})
+
+// 新的 /api/ocr/baidu/vat 路由（支持三层降级）
+fastify.post('/api/ocr/baidu/vat', async (request, reply) => {
+  try {
+    const {
+      images,
+      pdfBase64,
+      fileName,
+      provider,
+      providers = ['local', 'baidu', 'tencent'],
+      allowFallback = true,
+      skipLocal = false,
+      credentials = {},
+      confidenceThreshold = Number(process.env.CONFIDENCE_THRESHOLD ?? 0.8)
+    } = request.body
+
+    if (!images || images.length === 0) {
+      return reply.status(400).send({ error: '缺少 images 参数' })
+    }
+
+    // 使用队列管理并发
+    const results = await queue.add(async () => {
+      const { result, usedProviders, error } = await recognizeWithFallback({
+        imageBase64: images[0], // 使用第一张图片
+        skipLocal,
+        providers: allowFallback ? providers : [provider || 'local'],
+        baiduApiKey: credentials.baiduApiKey,
+        baiduSecretKey: credentials.baiduSecretKey,
+        tencentSecretId: credentials.tencentSecretId,
+        tencentSecretKey: credentials.tencentSecretKey,
+        tencentRegion: credentials.tencentRegion,
+        googleApiKey: credentials.googleApiKey,
+        googleProjectId: credentials.googleProjectId,
+        pdfBase64,
+        fileName,
+        confidenceThreshold
+      })
+
+      if (error) {
+        throw new Error(error)
+      }
+
+      // 返回统一格式
+      const response = {
+        success: result ? true : false
+      }
+
+      if (result?.data) {
+        Object.assign(response, result.data)
+      }
+
+      response.meta = {
+        ...(result?.meta || {}),
+        usedProviders,
+        fileName
+      }
+
+      await writeOcrLog(fileName, response)
+      return response
+    })
+
+    return reply.status(200).send(results)
+  } catch (error) {
+    fastify.log.error('三层降级 OCR 识别失败:', error)
+    return reply.status(500).send({ error: error.message })
   }
 })
 
